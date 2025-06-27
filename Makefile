@@ -59,7 +59,7 @@ clean:
 	rm -f $(LIB_NAME).so $(LIB_NAME).a $(LIB_NAME).h
 	rm -f test_c_shared test_c_static
 	@echo "Clean complete"
-	rm -f witness_input.json r1cs.bin verifying_key.bin
+	rm -f witness_input.json r1cs.bin verifying_key.bin proving_key.bin
 # Install dependencies (if needed)
 deps:
 	@echo "Installing Go dependencies..."
