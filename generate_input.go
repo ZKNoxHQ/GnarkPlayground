@@ -15,6 +15,7 @@ import (
 	"time" // Added for performance timing
 
 	"github.com/consensys/gnark-crypto/ecc"
+	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 	mimcOut "github.com/consensys/gnark-crypto/ecc/bn254/fr/mimc"
 	"github.com/consensys/gnark/backend/groth16"
 	"github.com/consensys/gnark/frontend"
@@ -24,7 +25,6 @@ import (
 	"github.com/consensys/gnark/std/math/emulated"
 	"github.com/consensys/gnark/std/signature/ecdsa"
 	gnarkecdsa "github.com/consensys/gnark/std/signature/ecdsa"
-
 	"golang.org/x/crypto/cryptobyte"
 	"golang.org/x/crypto/cryptobyte/asn1"
 )
@@ -55,11 +55,23 @@ func (c *EcdsaCircuitWithCommitment[T, S]) Define(api frontend.API) error {
 		return err
 	}
 
-	// Hash the public key coordinates and nonce
-	mimc.Write(c.Pub.X.Limbs...)
-	mimc.Write(c.Pub.Y.Limbs...)
-	mimc.Write(c.Nonce.Limbs...)
+	// Write pk_x limbs to hash
+	for _, limb := range c.Pub.X.Limbs {
+		mimc.Write(limb)
+	}
+
+	// Write pk_y limbs to hash
+	for _, limb := range c.Pub.Y.Limbs {
+		mimc.Write(limb)
+	}
+
+	// Write nonce limbs to hash
+	for _, limb := range c.Nonce.Limbs {
+		mimc.Write(limb)
+	}
+
 	computedCommitment := mimc.Sum()
+	fmt.Println(computedCommitment)
 
 	// Assert that the computed commitment matches the public commitment
 	api.AssertIsEqual(c.PubKeyCommitment, computedCommitment)
@@ -79,10 +91,12 @@ type ProveInputEcdsaWithCommitment struct {
 }
 
 func main() {
+
 	fmt.Println("--- Generating ECDSA circuit inputs and performing compliance check ---")
 
 	// 1. Off-circuit ECDSA signature generation (to get inputs for the circuit)
 	privKey, _ := cryptoecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	fmt.Println(privKey)
 	publicKey := privKey.PublicKey
 
 	msg := []byte("testing ECDSA with gnark-CGO")
@@ -105,11 +119,16 @@ func main() {
 
 	// 2. Generate commitment to public key using MiMC
 	// Generate a random nonce for the commitment
+	// TODO FIND OUT WHY THE HASH EVENTUALLY RETURN 0 SOMETIMES...
 	upperBound := new(big.Int).Lsh(big.NewInt(1), 256) // 2^256
 	nonce, err := rand.Int(rand.Reader, upperBound)
 	if err != nil {
 		fmt.Println("Failed to create the nonce: %w", err)
 	}
+	// convert nonce mod CurveScalarField
+	var nonce_mod_r fr.Element
+	nonce_mod_r.SetBigInt(nonce)
+	nonce_mod_r_bytes := nonce_mod_r.Bytes()
 
 	// Create MiMC hasher (using bn254 curve params for compatibility with gnark)
 	hasher := mimcOut.NewMiMC()
@@ -117,7 +136,7 @@ func main() {
 	// Hash: MiMC(pubX || pubY || nonce)
 	hasher.Write(publicKey.X.Bytes())
 	hasher.Write(publicKey.Y.Bytes())
-	hasher.Write(nonce.Bytes())
+	hasher.Write(nonce_mod_r_bytes[:])
 	commitment := hasher.Sum(nil)
 
 	// Convert commitment to big.Int
