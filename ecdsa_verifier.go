@@ -25,51 +25,27 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
 	"math/big"
-	"os"
 	"time"
 	"unsafe"
 
 	"github.com/consensys/gnark-crypto/ecc"
+	mimcOut "github.com/consensys/gnark-crypto/ecc/bn254/fr/mimc" // use correct curve
 	"github.com/consensys/gnark/backend/groth16"
 	"github.com/consensys/gnark/frontend"
-	"github.com/consensys/gnark/std/algebra/emulated/sw_emulated"
 	"github.com/consensys/gnark/std/math/emulated"
 	gnarkecdsa "github.com/consensys/gnark/std/signature/ecdsa"
 )
 
-// EcdsaCircuit defines the circuit structure
-type EcdsaCircuit[T, S emulated.FieldParams] struct {
-	Sig gnarkecdsa.Signature[S]
-	Msg emulated.Element[S]
-	Pub gnarkecdsa.PublicKey[T, S]
-}
-
-func (c *EcdsaCircuit[T, S]) Define(api frontend.API) error {
-	curveParams := sw_emulated.GetCurveParams[T]()
-	c.Pub.Verify(api, curveParams, &c.Msg, &c.Sig)
-	return nil
-}
-
-// ProveInputEcdsa struct for JSON serialization
-type ProveInputEcdsa struct {
-	MsgHash string `json:"msgHash"`
-	R       string `json:"r"`
-	S       string `json:"s"`
-	PubX    string `json:"pubX"`
-	PubY    string `json:"pubY"`
-}
-
 // Helper function to generate a valid ECDSA signature and key pair
-func generateValidECDSAData() (*ProveInputEcdsa, error) {
+func generateValidECDSAData() (*ProveInputEcdsaWithCommitment, error) {
 	// Generate a new private key on P-256 curve
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate private key: %w", err)
 	}
+	publicKey := privateKey.PublicKey
 
 	// Generate a random message
 	message := make([]byte, 32)
@@ -87,13 +63,34 @@ func generateValidECDSAData() (*ProveInputEcdsa, error) {
 		return nil, fmt.Errorf("failed to sign message: %w", err)
 	}
 
+	// Generate a random nonce for the commitment
+	upperBound := new(big.Int).Lsh(big.NewInt(1), 256) // 2^256
+	nonce, err := rand.Int(rand.Reader, upperBound)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to create the nonce: %w", err)
+	}
+
+	// Create MiMC hasher (using bn254 curve params for compatibility with gnark)
+	hasher := mimcOut.NewMiMC()
+
+	// Hash: MiMC(pubX || pubY || nonce)
+	hasher.Write(publicKey.X.Bytes())
+	hasher.Write(publicKey.Y.Bytes())
+	hasher.Write(nonce.Bytes())
+	commitment := hasher.Sum(nil)
+
+	// Convert commitment to big.Int
+	commitmentBigInt := new(big.Int).SetBytes(commitment)
+
 	// Create ProveInputEcdsa with proper values
-	proveInput := &ProveInputEcdsa{
-		MsgHash: hex.EncodeToString(hash[:]),
-		R:       hex.EncodeToString(r.Bytes()),
-		S:       hex.EncodeToString(s.Bytes()),
-		PubX:    hex.EncodeToString(privateKey.PublicKey.X.Bytes()),
-		PubY:    hex.EncodeToString(privateKey.PublicKey.Y.Bytes()),
+	proveInput := &ProveInputEcdsaWithCommitment{
+		MsgHash:          hex.EncodeToString(hash[:]),
+		R:                hex.EncodeToString(r.Bytes()),
+		S:                hex.EncodeToString(s.Bytes()),
+		PubX:             hex.EncodeToString(privateKey.PublicKey.X.Bytes()),
+		PubY:             hex.EncodeToString(privateKey.PublicKey.Y.Bytes()),
+		PubKeyCommitment: hex.EncodeToString(commitmentBigInt.Bytes()),
+		Nonce:            hex.EncodeToString(nonce.Bytes()),
 	}
 
 	// Verify the signature is correct (sanity check)
@@ -105,22 +102,24 @@ func generateValidECDSAData() (*ProveInputEcdsa, error) {
 }
 
 // Helper function to create a variant of the original input with valid ECDSA data
-func createVariantProveInput(original *ProveInputEcdsa) *ProveInputEcdsa {
+func createVariantProveInput(original *ProveInputEcdsaWithCommitment) *ProveInputEcdsaWithCommitment {
 	// Generate a completely new valid ECDSA signature and key pair
 	variant, err := generateValidECDSAData()
 	if err != nil {
 		fmt.Printf("Warning: Failed to generate valid ECDSA data, using original: %v\n", err)
 		// If generation fails, add timestamp to original to make it different
 		timestamp := fmt.Sprintf("%x", time.Now().UnixNano())
-		return &ProveInputEcdsa{
-			MsgHash: original.MsgHash[:50] + timestamp[:14], // Replace last 14 chars with timestamp
-			R:       original.R,
-			S:       original.S,
-			PubX:    original.PubX,
-			PubY:    original.PubY,
+		return &ProveInputEcdsaWithCommitment{
+			MsgHash:          original.MsgHash[:50] + timestamp[:14], // Replace last 14 chars with timestamp
+			R:                original.R,
+			S:                original.S,
+			PubX:             original.PubX,
+			PubY:             original.PubY,
+			PubKeyCommitment: original.PubKeyCommitment,
+			Nonce:            original.Nonce,
 		}
 	}
-	
+
 	return variant
 }
 func cStringToGoString(cStr *C.char) string {
@@ -140,33 +139,6 @@ func freeCString(cStr *C.char) {
 	if cStr != nil {
 		C.free(unsafe.Pointer(cStr))
 	}
-}
-
-// readFromFile helper function
-func readFromFile(filename string, data interface{}) error {
-	file, err := os.Open(filename)
-	if err != nil {
-		return fmt.Errorf("error opening file %s: %w", filename, err)
-	}
-	defer file.Close()
-
-	switch v := data.(type) {
-	case io.ReaderFrom:
-		_, err = v.ReadFrom(file)
-		if err != nil && err != io.EOF {
-			return fmt.Errorf("error reading from file %s into io.ReaderFrom: %w", filename, err)
-		}
-	case *ProveInputEcdsa:
-		decoder := json.NewDecoder(file)
-		err = decoder.Decode(v)
-		if err != nil {
-			return fmt.Errorf("error decoding JSON from file %s: %w", filename, err)
-		}
-	default:
-		return fmt.Errorf("unsupported type for reading from file: %T", data)
-	}
-
-	return nil
 }
 
 // Core proof generation and verification logic
@@ -198,13 +170,13 @@ func performProofVerification() error {
 	fmt.Println("Read verifying_key.bin")
 
 	// 4. Read back the prove input JSON
-	var loadedProveInput ProveInputEcdsa
+	var loadedProveInput ProveInputEcdsaWithCommitment
 	err = readFromFile("witness_input.json", &loadedProveInput)
 	if err != nil {
 		return fmt.Errorf("error reading witness_input.json: %w", err)
 	}
 	fmt.Println("Read witness_input.json")
-	
+
 	// Display the ProveInput data for reference
 	fmt.Println("\n--- ProveInput Data (for C interface reference) ---")
 	fmt.Printf("MsgHash: %s\n", loadedProveInput.MsgHash)
@@ -212,6 +184,8 @@ func performProofVerification() error {
 	fmt.Printf("S:       %s\n", loadedProveInput.S)
 	fmt.Printf("PubX:    %s\n", loadedProveInput.PubX)
 	fmt.Printf("PubY:    %s\n", loadedProveInput.PubY)
+	fmt.Printf("PublicKeyCommitment:    %s\n", loadedProveInput.PubKeyCommitment)
+	fmt.Printf("Nonce:    %s\n", loadedProveInput.Nonce)
 	fmt.Println("--- End ProveInput Data ---")
 
 	// Decode hex strings back to big.Int and byte slices
@@ -235,14 +209,24 @@ func performProofVerification() error {
 	if err != nil {
 		return fmt.Errorf("error decoding PubY hex: %w", err)
 	}
+	pubKeyCommitmentBytes, err := hex.DecodeString(loadedProveInput.PubKeyCommitment)
+	if err != nil {
+		return fmt.Errorf("error decoding PubKeyCommitment hex: %w", err)
+	}
+	NonceBytes, err := hex.DecodeString(loadedProveInput.Nonce)
+	if err != nil {
+		return fmt.Errorf("error decoding Nonce hex: %w", err)
+	}
 
 	rLoaded := new(big.Int).SetBytes(rBytes)
 	sLoaded := new(big.Int).SetBytes(sBytes)
 	pubXLoaded := new(big.Int).SetBytes(pubXBytes)
 	pubYLoaded := new(big.Int).SetBytes(pubYBytes)
+	pubKeyCommitmentLoaded := new(big.Int).SetBytes(pubKeyCommitmentBytes)
+	NonceLoaded := new(big.Int).SetBytes(NonceBytes)
 
 	// 5. Create a new witness using the loaded input data
-	witnessCircuitLoaded := EcdsaCircuit[emulated.P256Fp, emulated.P256Fr]{
+	witnessCircuitLoaded := EcdsaCircuitWithCommitment[emulated.P256Fp, emulated.P256Fr]{
 		Sig: gnarkecdsa.Signature[emulated.P256Fr]{
 			R: emulated.ValueOf[emulated.P256Fr](rLoaded),
 			S: emulated.ValueOf[emulated.P256Fr](sLoaded),
@@ -252,6 +236,8 @@ func performProofVerification() error {
 			X: emulated.ValueOf[emulated.P256Fp](pubXLoaded),
 			Y: emulated.ValueOf[emulated.P256Fp](pubYLoaded),
 		},
+		PubKeyCommitment: emulated.ValueOf[emulated.P256Fp](pubKeyCommitmentLoaded),
+		Nonce:            emulated.ValueOf[emulated.P256Fp](NonceLoaded),
 	}
 
 	witnessFullLoaded, err := frontend.NewWitness(&witnessCircuitLoaded, ecc.BN254.ScalarField())
@@ -288,7 +274,7 @@ func performProofVerification() error {
 }
 
 // Core proof generation with custom inputs
-func performProofVerificationWithInputs(proveInput *ProveInputEcdsa) error {
+func performProofVerificationWithInputs(proveInput *ProveInputEcdsaWithCommitment) error {
 	// 1. Read back the compiled circuit
 	loadedR1CS := groth16.NewCS(ecc.BN254)
 	err := readFromFile("r1cs.bin", loadedR1CS)
@@ -331,14 +317,24 @@ func performProofVerificationWithInputs(proveInput *ProveInputEcdsa) error {
 	if err != nil {
 		return fmt.Errorf("error decoding PubY hex: %w", err)
 	}
+	pubKeyCommitmentBytes, err := hex.DecodeString(proveInput.PubKeyCommitment)
+	if err != nil {
+		return fmt.Errorf("error decoding PubKeyCommitment hex: %w", err)
+	}
+	NonceBytes, err := hex.DecodeString(proveInput.Nonce)
+	if err != nil {
+		return fmt.Errorf("error decoding Nonce hex: %w", err)
+	}
 
 	rLoaded := new(big.Int).SetBytes(rBytes)
 	sLoaded := new(big.Int).SetBytes(sBytes)
 	pubXLoaded := new(big.Int).SetBytes(pubXBytes)
 	pubYLoaded := new(big.Int).SetBytes(pubYBytes)
+	pubKeyCommitmentLoaded := new(big.Int).SetBytes(pubKeyCommitmentBytes)
+	NonceLoaded := new(big.Int).SetBytes(NonceBytes)
 
 	// Create witness
-	witnessCircuitLoaded := EcdsaCircuit[emulated.P256Fp, emulated.P256Fr]{
+	witnessCircuitLoaded := EcdsaCircuitWithCommitment[emulated.P256Fp, emulated.P256Fr]{
 		Sig: gnarkecdsa.Signature[emulated.P256Fr]{
 			R: emulated.ValueOf[emulated.P256Fr](rLoaded),
 			S: emulated.ValueOf[emulated.P256Fr](sLoaded),
@@ -348,6 +344,8 @@ func performProofVerificationWithInputs(proveInput *ProveInputEcdsa) error {
 			X: emulated.ValueOf[emulated.P256Fp](pubXLoaded),
 			Y: emulated.ValueOf[emulated.P256Fp](pubYLoaded),
 		},
+		PubKeyCommitment: emulated.ValueOf[emulated.P256Fp](pubKeyCommitmentLoaded),
+		Nonce:            emulated.ValueOf[emulated.P256Fp](NonceLoaded),
 	}
 
 	witnessFullLoaded, err := frontend.NewWitness(&witnessCircuitLoaded, ecc.BN254.ScalarField())
@@ -391,14 +389,16 @@ func RunProofVerification() C.ProofResult {
 }
 
 //export RunProofVerificationWithInputs
-func RunProofVerificationWithInputs(input C.ProveInput) C.ProofResult {
+func RunProofVerificationWithInputs(input C.ProveInputEcdsaWithCommitment) C.ProofResult {
 	// Convert C input to Go struct
-	proveInput := &ProveInputEcdsa{
-		MsgHash: cStringToGoString(input.msgHash),
-		R:       cStringToGoString(input.r),
-		S:       cStringToGoString(input.s),
-		PubX:    cStringToGoString(input.pubX),
-		PubY:    cStringToGoString(input.pubY),
+	proveInput := &ProveInputEcdsaWithCommitment{
+		MsgHash:          cStringToGoString(input.msgHash),
+		R:                cStringToGoString(input.r),
+		S:                cStringToGoString(input.s),
+		PubX:             cStringToGoString(input.pubX),
+		PubY:             cStringToGoString(input.pubY),
+		PubKeyCommitment: cStringToGoString(input.PubKeyCommitment),
+		Nonce:            cStringToGoString(input.Nonce),
 	}
 
 	err := performProofVerificationWithInputs(proveInput)
@@ -421,65 +421,65 @@ func FreeProofResult(result C.ProofResult) {
 	}
 }
 
-// Go main function for testing
-func main() {
-	// Test the C export functions
-	fmt.Println("Testing cGO ECDSA Proof Verifier...")
-	
-	// Test 1: Run proof verification from files
-	fmt.Println("\n=== Test 1: RunProofVerification ===")
-	result1 := RunProofVerification()
-	if result1.success == 1 {
-		fmt.Println("✓ RunProofVerification succeeded")
-	} else {
-		fmt.Printf("✗ RunProofVerification failed: %s\n", cStringToGoString(result1.error_msg))
-	}
-	FreeProofResult(result1)
+// // Go main function for testing
+// func main() {
+// 	// Test the C export functions
+// 	fmt.Println("Testing cGO ECDSA Proof Verifier...")
 
-	// Test 2: Run proof verification with custom inputs (generating variant input)
-	fmt.Println("\n=== Test 2: RunProofVerificationWithInputs ===")
-	var loadedProveInput ProveInputEcdsa
-	err := readFromFile("witness_input.json", &loadedProveInput)
-	if err != nil {
-		fmt.Printf("✗ Error reading witness_input.json for test: %v\n", err)
-		return
-	}
+// 	// Test 1: Run proof verification from files
+// 	fmt.Println("\n=== Test 1: RunProofVerification ===")
+// 	result1 := RunProofVerification()
+// 	if result1.success == 1 {
+// 		fmt.Println("✓ RunProofVerification succeeded")
+// 	} else {
+// 		fmt.Printf("✗ RunProofVerification failed: %s\n", cStringToGoString(result1.error_msg))
+// 	}
+// 	FreeProofResult(result1)
 
-	// Generate a variant input for this execution
-	variantProveInput := createVariantProveInput(&loadedProveInput)
+// 	// Test 2: Run proof verification with custom inputs (generating variant input)
+// 	fmt.Println("\n=== Test 2: RunProofVerificationWithInputs ===")
+// 	var loadedProveInput ProveInputEcdsaWithCommitment
+// 	err := readFromFile("witness_input.json", &loadedProveInput)
+// 	if err != nil {
+// 		fmt.Printf("✗ Error reading witness_input.json for test: %v\n", err)
+// 		return
+// 	}
 
-	fmt.Println("\n--- Generated NEW VALID ECDSA ProveInput for this execution ---")
-	fmt.Printf("MsgHash: %s\n", variantProveInput.MsgHash)
-	fmt.Printf("R:       %s\n", variantProveInput.R)
-	fmt.Printf("S:       %s\n", variantProveInput.S)
-	fmt.Printf("PubX:    %s\n", variantProveInput.PubX)
-	fmt.Printf("PubY:    %s\n", variantProveInput.PubY)
-	fmt.Println("--- Copy these NEW VALID values for your C program ---")
-	fmt.Println("--- Note: These are cryptographically valid ECDSA signature + key pair ---")
+// 	// Generate a variant input for this execution
+// 	variantProveInput := createVariantProveInput(&loadedProveInput)
 
-	// Convert to C input using the variant data
-	cInput := C.ProveInput{
-		msgHash: goStringToCString(variantProveInput.MsgHash),
-		r:       goStringToCString(variantProveInput.R),
-		s:       goStringToCString(variantProveInput.S),
-		pubX:    goStringToCString(variantProveInput.PubX),
-		pubY:    goStringToCString(variantProveInput.PubY),
-	}
+// 	fmt.Println("\n--- Generated NEW VALID ECDSA ProveInput for this execution ---")
+// 	fmt.Printf("MsgHash: %s\n", variantProveInput.MsgHash)
+// 	fmt.Printf("R:       %s\n", variantProveInput.R)
+// 	fmt.Printf("S:       %s\n", variantProveInput.S)
+// 	fmt.Printf("PubX:    %s\n", variantProveInput.PubX)
+// 	fmt.Printf("PubY:    %s\n", variantProveInput.PubY)
+// 	fmt.Println("--- Copy these NEW VALID values for your C program ---")
+// 	fmt.Println("--- Note: These are cryptographically valid ECDSA signature + key pair ---")
 
-	result2 := RunProofVerificationWithInputs(cInput)
-	if result2.success == 1 {
-		fmt.Println("✓ RunProofVerificationWithInputs succeeded")
-	} else {
-		fmt.Printf("✗ RunProofVerificationWithInputs failed: %s\n", cStringToGoString(result2.error_msg))
-	}
+// 	// Convert to C input using the variant data
+// 	cInput := C.ProveInput{
+// 		msgHash: goStringToCString(variantProveInput.MsgHash),
+// 		r:       goStringToCString(variantProveInput.R),
+// 		s:       goStringToCString(variantProveInput.S),
+// 		pubX:    goStringToCString(variantProveInput.PubX),
+// 		pubY:    goStringToCString(variantProveInput.PubY),
+// 	}
 
-	// Clean up
-	freeCString(cInput.msgHash)
-	freeCString(cInput.r)
-	freeCString(cInput.s)
-	freeCString(cInput.pubX)
-	freeCString(cInput.pubY)
-	FreeProofResult(result2)
+// 	result2 := RunProofVerificationWithInputs(cInput)
+// 	if result2.success == 1 {
+// 		fmt.Println("✓ RunProofVerificationWithInputs succeeded")
+// 	} else {
+// 		fmt.Printf("✗ RunProofVerificationWithInputs failed: %s\n", cStringToGoString(result2.error_msg))
+// 	}
 
-	fmt.Println("\ncGO ECDSA Proof Verifier tests completed.")
-}
+// 	// Clean up
+// 	freeCString(cInput.msgHash)
+// 	freeCString(cInput.r)
+// 	freeCString(cInput.s)
+// 	freeCString(cInput.pubX)
+// 	freeCString(cInput.pubY)
+// 	FreeProofResult(result2)
+
+// 	fmt.Println("\ncGO ECDSA Proof Verifier tests completed.")
+// }

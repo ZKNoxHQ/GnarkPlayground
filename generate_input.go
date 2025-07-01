@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bytes" 
+	"bytes"
 	cryptoecdsa "crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -15,37 +15,67 @@ import (
 	"time" // Added for performance timing
 
 	"github.com/consensys/gnark-crypto/ecc"
+	mimcOut "github.com/consensys/gnark-crypto/ecc/bn254/fr/mimc"
 	"github.com/consensys/gnark/backend/groth16"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
 	"github.com/consensys/gnark/std/algebra/emulated/sw_emulated"
+	"github.com/consensys/gnark/std/hash/mimc"
 	"github.com/consensys/gnark/std/math/emulated"
 	"github.com/consensys/gnark/std/signature/ecdsa"
-	
+	gnarkecdsa "github.com/consensys/gnark/std/signature/ecdsa"
+
 	"golang.org/x/crypto/cryptobyte"
 	"golang.org/x/crypto/cryptobyte/asn1"
 )
 
 // EcdsaCircuit defines the circuit structure as provided by you.
-type EcdsaCircuit[T, S emulated.FieldParams] struct {
-	Sig ecdsa.Signature[S]
-	Msg emulated.Element[S] //`gnark:",public"` // Public input
-	Pub ecdsa.PublicKey[T, S] //`gnark:",public"` // Public input
+type EcdsaCircuitWithCommitment[T, S emulated.FieldParams] struct {
+	// Public inputs
+	Sig gnarkecdsa.Signature[S] `gnark:",public"`
+	Msg emulated.Element[S]     `gnark:",public"`
+
+	// Commitment to public key (public)
+	PubKeyCommitment frontend.Variable `gnark:",public"` //emulated.Element[S] `gnark:",public"`
+
+	// Private inputs (witness)
+	Pub   gnarkecdsa.PublicKey[T, S] // Private: the actual public key
+	Nonce emulated.Element[T]        // Private: random nonce for commitment
 }
 
-func (c *EcdsaCircuit[T, S]) Define(api frontend.API) error {
+func (c *EcdsaCircuitWithCommitment[T, S]) Define(api frontend.API) error {
+	// 1. Verify the ECDSA signature
 	curveParams := sw_emulated.GetCurveParams[T]()
 	c.Pub.Verify(api, curveParams, &c.Msg, &c.Sig)
+
+	// 2. Verify the commitment to the public key
+	// commitment = MiMC(pubX || pubY || nonce)
+	mimc, err := mimc.NewMiMC(api)
+	if err != nil {
+		return err
+	}
+
+	// Hash the public key coordinates and nonce
+	mimc.Write(c.Pub.X.Limbs...)
+	mimc.Write(c.Pub.Y.Limbs...)
+	mimc.Write(c.Nonce.Limbs...)
+	computedCommitment := mimc.Sum()
+
+	// Assert that the computed commitment matches the public commitment
+	api.AssertIsEqual(c.PubKeyCommitment, computedCommitment)
+
 	return nil
 }
 
 // ProveInputEcdsa struct for JSON serialization of witness inputs.
-type ProveInputEcdsa struct {
-	MsgHash string `json:"msgHash"` // Hex string of the message hash
-	R       string `json:"r"`       // Hex string of signature R
-	S       string `json:"s"`       // Hex string of signature S
-	PubX    string `json:"pubX"`    // Hex string of public key X
-	PubY    string `json:"pubY"`    // Hex string of public key Y
+type ProveInputEcdsaWithCommitment struct {
+	MsgHash          string `json:"msgHash"` // Hex string of the message hash
+	R                string `json:"r"`       // Hex string of signature R
+	S                string `json:"s"`       // Hex string of signature S
+	PubX             string `json:"pubX"`    // Hex string of public key X
+	PubY             string `json:"pubY"`    // Hex string of public key Y
+	PubKeyCommitment string `json:"pubCom"`  // Hex string of public key commitment
+	Nonce            string `json:"nonce"`   // Hex string of nonce
 }
 
 func main() {
@@ -73,33 +103,57 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 2. Prepare JSON input for proving
-	proveInput := ProveInputEcdsa{
-		MsgHash: hex.EncodeToString(msgHash[:]),
-		R:       hex.EncodeToString(r.Bytes()),
-		S:       hex.EncodeToString(s.Bytes()),
-		PubX:    hex.EncodeToString(publicKey.X.Bytes()),
-		PubY:    hex.EncodeToString(publicKey.Y.Bytes()),
+	// 2. Generate commitment to public key using MiMC
+	// Generate a random nonce for the commitment
+	upperBound := new(big.Int).Lsh(big.NewInt(1), 256) // 2^256
+	nonce, err := rand.Int(rand.Reader, upperBound)
+	if err != nil {
+		fmt.Println("Failed to create the nonce: %w", err)
 	}
-	proveInputJSON, err := json.MarshalIndent(proveInput, "", "  ")
+
+	// Create MiMC hasher (using bn254 curve params for compatibility with gnark)
+	hasher := mimcOut.NewMiMC()
+
+	// Hash: MiMC(pubX || pubY || nonce)
+	hasher.Write(publicKey.X.Bytes())
+	hasher.Write(publicKey.Y.Bytes())
+	hasher.Write(nonce.Bytes())
+	commitment := hasher.Sum(nil)
+
+	// Convert commitment to big.Int
+	commitmentBigInt := new(big.Int).SetBytes(commitment)
+
+	// 3. Prepare JSON input for proving
+	proveInput := ProveInputEcdsaWithCommitment{
+		MsgHash:          hex.EncodeToString(msgHash[:]),
+		R:                hex.EncodeToString(r.Bytes()),
+		S:                hex.EncodeToString(s.Bytes()),
+		PubX:             hex.EncodeToString(publicKey.X.Bytes()),
+		PubY:             hex.EncodeToString(publicKey.Y.Bytes()),
+		Nonce:            hex.EncodeToString(nonce.Bytes()),
+		PubKeyCommitment: hex.EncodeToString(commitment),
+	}
+
+	proveInputJSON, err := json.MarshalIndent(proveInput, "", " ")
 	if err != nil {
 		fmt.Printf("Error marshaling prove input JSON: %v\n", err)
 		os.Exit(1)
 	}
+	fmt.Printf("Prove input JSON:\n%s\n", proveInputJSON)
 
-	// 3. Compile the circuit
-	circuit := EcdsaCircuit[emulated.P256Fp, emulated.P256Fr]{}
+	// 4. Compile the circuit
+	circuit := EcdsaCircuitWithCommitment[emulated.P256Fp, emulated.P256Fr]{}
 	fmt.Printf("Compiling circuit...\n")
 	ecdsaR1CS, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &circuit)
 	if err != nil {
 		fmt.Printf("Error compiling ECDSA circuit: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("BN254 circuit compiled with %d constraints",
+	fmt.Printf("BN254 circuit compiled with %d constraints\n",
 		ecdsaR1CS.GetNbConstraints())
+	fmt.Printf("CIRCUIT COMPILED\n")
 
-
-	// 4. Perform Groth16 setup
+	// 5. Perform Groth16 setup
 	fmt.Printf("Starting Groth16 setup...\n")
 	ecdsaPK, ecdsaVK, err := groth16.Setup(ecdsaR1CS)
 	if err != nil {
@@ -108,17 +162,19 @@ func main() {
 	}
 	fmt.Printf("Setup done.\n")
 
-	// 5. Create the full witness for the circuit (includes private and public parts)
-	witnessCircuit := EcdsaCircuit[emulated.P256Fp, emulated.P256Fr]{
+	// 6. Create the full witness for the circuit (includes private and public parts)
+	witnessCircuit := EcdsaCircuitWithCommitment[emulated.P256Fp, emulated.P256Fr]{
 		Sig: ecdsa.Signature[emulated.P256Fr]{
 			R: emulated.ValueOf[emulated.P256Fr](r),
 			S: emulated.ValueOf[emulated.P256Fr](s),
 		},
-		Msg: emulated.ValueOf[emulated.P256Fr](msgHash[:]),
+		Msg:              emulated.ValueOf[emulated.P256Fr](msgHash[:]),
+		PubKeyCommitment: commitmentBigInt, // TODO SIMON IS IT SECURE?
 		Pub: ecdsa.PublicKey[emulated.P256Fp, emulated.P256Fr]{
 			X: emulated.ValueOf[emulated.P256Fp](publicKey.X),
 			Y: emulated.ValueOf[emulated.P256Fp](publicKey.Y),
 		},
+		Nonce: emulated.ValueOf[emulated.P256Fp](nonce),
 	}
 	witnessFull, err := frontend.NewWitness(&witnessCircuit, ecc.BN254.ScalarField())
 	if err != nil {
@@ -131,7 +187,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 6. Perform a compliance check: Prove and Verify
+	// 7. Perform a compliance check: Prove and Verify
 	fmt.Println("\n--- Performing compliance check (Prove & Verify within generate_input.go) ---")
 
 	// Prove
@@ -153,7 +209,7 @@ func main() {
 	fmt.Printf("Compliance check: Verification SUCCEEDED (%.1fms)!\n", float64(time.Since(startVerify).Milliseconds()))
 	fmt.Println("Compliance check PASSED. Generated inputs are valid.")
 
-	// 7. Write outputs to files (same as before)
+	// 8. Write outputs to files (same as before)
 	writeToFile("r1cs.bin", ecdsaR1CS)
 	writeToFile("proving_key.bin", ecdsaPK)
 	writeToFile("verifying_key.bin", ecdsaVK)
@@ -161,8 +217,7 @@ func main() {
 
 	fmt.Println("\nAll input files generated successfully for CGO wrapper.")
 
-
-	// 8. Test the ReadFromFile functionality
+	// 9. Test the ReadFromFile functionality
 	testReadFromFile()
 
 	fmt.Println("\nAll input files generated successfully for CGO wrapper.")
@@ -192,34 +247,6 @@ func writeToFile(filename string, data interface{}) {
 		os.Exit(1)
 	}
 	fmt.Printf("Wrote %s\n", filename)
-}
-
-
-// readFromFile is a helper to deserialize and read gnark objects or JSON from files.
-func readFromFile(filename string, data interface{}) error {
-	file, err := os.Open(filename)
-	if err != nil {
-		return fmt.Errorf("error opening file %s: %w", filename, err)
-	}
-	defer file.Close()
-
-	switch v := data.(type) {
-	case io.ReaderFrom:
-		_, err = v.ReadFrom(file)
-		if err != nil && err != io.EOF { // io.EOF is expected if the file is empty or partially read
-			return fmt.Errorf("error reading from file %s into io.ReaderFrom: %w", filename, err)
-		}
-	case *ProveInputEcdsa: // For the JSON input
-		decoder := json.NewDecoder(file)
-		err = decoder.Decode(v)
-		if err != nil {
-			return fmt.Errorf("error decoding JSON from file %s: %w", filename, err)
-		}
-	default:
-		return fmt.Errorf("unsupported type for reading from file: %T", data)
-	}
-
-	return nil
 }
 
 // testReadFromFile reads the generated files back and performs a verification.
@@ -254,7 +281,7 @@ func testReadFromFile() {
 	fmt.Println("Read verifying_key.bin")
 
 	// 4. Read back the prove input JSON
-	var loadedProveInput ProveInputEcdsa
+	var loadedProveInput ProveInputEcdsaWithCommitment
 	err = readFromFile("witness_input.json", &loadedProveInput)
 	if err != nil {
 		fmt.Printf("Error reading witness_input.json: %v\n", err)
@@ -278,6 +305,8 @@ func testReadFromFile() {
 		fmt.Printf("Error decoding MsgHash hex: %v\n", err)
 		os.Exit(1)
 	}
+	pubKeyCommitmentBytes, err := hex.DecodeString(loadedProveInput.PubKeyCommitment)
+	NonceBytes, err := hex.DecodeString(loadedProveInput.Nonce)
 	pubXBytes, err := hex.DecodeString(loadedProveInput.PubX)
 	if err != nil {
 		fmt.Printf("Error decoding PubX hex: %v\n", err)
@@ -293,18 +322,21 @@ func testReadFromFile() {
 	sLoaded := new(big.Int).SetBytes(sBytes)
 	pubXLoaded := new(big.Int).SetBytes(pubXBytes)
 	pubYLoaded := new(big.Int).SetBytes(pubYBytes)
+	NonceLoaded := new(big.Int).SetBytes(NonceBytes)
 
 	// 5. Create a new witness using the loaded input data
-	witnessCircuitLoaded := EcdsaCircuit[emulated.P256Fp, emulated.P256Fr]{
-		Sig: ecdsa.Signature[emulated.P256Fr]{
+	witnessCircuitLoaded := EcdsaCircuitWithCommitment[emulated.P256Fp, emulated.P256Fr]{
+		Sig: gnarkecdsa.Signature[emulated.P256Fr]{
 			R: emulated.ValueOf[emulated.P256Fr](rLoaded),
 			S: emulated.ValueOf[emulated.P256Fr](sLoaded),
 		},
 		Msg: emulated.ValueOf[emulated.P256Fr](msgHashBytes),
-		Pub: ecdsa.PublicKey[emulated.P256Fp, emulated.P256Fr]{
+		Pub: gnarkecdsa.PublicKey[emulated.P256Fp, emulated.P256Fr]{
 			X: emulated.ValueOf[emulated.P256Fp](pubXLoaded),
 			Y: emulated.ValueOf[emulated.P256Fp](pubYLoaded),
 		},
+		PubKeyCommitment: emulated.ValueOf[emulated.P256Fr](pubKeyCommitmentBytes),
+		Nonce:            emulated.ValueOf[emulated.P256Fp](NonceLoaded),
 	}
 	witnessFullLoaded, err := frontend.NewWitness(&witnessCircuitLoaded, ecc.BN254.ScalarField())
 	if err != nil {
